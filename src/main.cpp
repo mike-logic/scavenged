@@ -1,10 +1,11 @@
 /**
- * SCAVENGER — ESP32 Scavenger Hunt Kiosk (Codeword Only)
+ * SCAVENGER — ESP32 Scavenger Hunt Kiosk (Codeword Only + Admin Auth)
  * - Setup mode: passworded AP for organizers + Admin UI with form rows
  * - Game mode: OPEN AP (no password), captive portal pushes players to /app
  * - Auto-reset-on-flash: clears admin hash when FW_VERSION changes
  * - Factory reset endpoint to wipe FS and reboot
  * - Player portal uses ONLY a text input for codewords (no camera/QR)
+ * - Admin is gated with HTTP Basic Auth after first-time setup
  *
  * PlatformIO: Arduino framework 2.0.x, LittleFS, AsyncWebServer, ArduinoJson
  */
@@ -18,6 +19,7 @@
 #include <FS.h>
 #include <ArduinoJson.h>
 #include <mbedtls/md.h>
+#include <mbedtls/base64.h>
 #include <DNSServer.h>
 #include <vector>
 #include <algorithm>
@@ -479,6 +481,53 @@ String getBody(AsyncWebServerRequest *request, uint8_t *data, size_t len) {
   return s;
 }
 
+// -------- Admin auth helpers (HTTP Basic) --------
+static String getHeader(AsyncWebServerRequest *req, const char* name) {
+  if (req->hasHeader(name)) return req->getHeader(name)->value();
+  return String();
+}
+
+static bool parseBasicAuth(const String& auth, String &user, String &pass) {
+  if (!auth.startsWith("Basic ")) return false;
+  String b64 = auth.substring(6);
+  size_t needed = 0;
+  // First call to learn required length
+  mbedtls_base64_decode(nullptr, 0, &needed,
+                        (const unsigned char*)b64.c_str(), b64.length());
+  if (needed == 0) return false;
+  std::vector<unsigned char> buf(needed + 1);
+  size_t olen = 0;
+  if (mbedtls_base64_decode(buf.data(), needed, &olen,
+                            (const unsigned char*)b64.c_str(), b64.length()) != 0) return false;
+  buf[olen] = 0;
+  String decoded = String((const char*)buf.data());
+  int colon = decoded.indexOf(':');
+  if (colon < 0) return false;
+  user = decoded.substring(0, colon);
+  pass = decoded.substring(colon + 1);
+  return true;
+}
+
+static bool adminGuard(AsyncWebServerRequest *req) {
+  // Allow first-time setup without auth
+  if (g_config.admin_hash.length() == 0) return true;
+
+  // Check Basic auth
+  String u, p;
+  String auth = getHeader(req, "Authorization"); // helper you already defined
+  if (parseBasicAuth(auth, u, p)) {
+    if (consttime_eq(sha256Hex(p), g_config.admin_hash)) return true;
+  }
+
+  // Challenge with WWW-Authenticate on a response object
+  AsyncWebServerResponse* r =
+      req->beginResponse(401, "text/plain", "Authentication required");
+  r->addHeader("WWW-Authenticate", "Basic realm=\"Scavenger Admin\"");
+  req->send(r);
+  return false;
+}
+
+
 // ------------------ HTML & PWA (raw strings) ------------------
 
 // Player portal: codeword-only flow
@@ -515,7 +564,7 @@ th{background:#f9f9f9}
 <div class="card">
   <h3>How it works</h3>
   <p class="small">
-    Connect to the event Wi‑Fi, create a team (or log in), and type the <b>codeword</b> printed at each checkpoint.
+    Connect to the event Wi-Fi, create a team (or log in), and type the <b>codeword</b> printed at each checkpoint.
   </p>
 </div>
 
@@ -548,20 +597,41 @@ th{background:#f9f9f9}
       <input id="codeword" placeholder="Type codeword here" maxlength="64" style="flex:1;min-width:220px">
       <button onclick="submitCode()">Submit</button>
     </div>
-    <div class="hint" style="margin-top:6px">Tip: Codes are not case‑sensitive and may include numbers or dashes.</div>
+    <div class="hint" style="margin-top:6px">Tip: Codes are not case-sensitive and may include numbers or dashes.</div>
   </div>
 </div>
 
 <script>
-let team_id=null, team_name="";
+var team_id=null, team_name="";
 
-function id(x){return document.getElementById(x)}
-function val(x){return id(x).value}
-function j(p,u,f){fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).then(r=>r.json()).then(f).catch(err=>toast(err?.message||'Network error'))}
-function t(u,f){fetch(u).then(r=>r.json()).then(f).catch(err=>toast(err?.message||'Network error'))}
+function id(x){return document.getElementById(x);}
+function val(x){var el=id(x); return el?el.value:'';}
 
-function reg(){ j({team_name:val('name'),pin:val('pin')},'/api/register',r=>{ if(r.ok){ team_id=r.team_id; team_name=val('name'); onAuth(); } else toast(JSON.stringify(r)); }) }
-function login(){ j({team_name:val('name'),pin:val('pin')},'/api/login',r=>{ if(r.ok){ team_id=r.team_id; team_name=val('name'); onAuth(); } else toast(JSON.stringify(r)); }) }
+function j(p,u,f){
+  fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)})
+    .then(function(r){return r.json();})
+    .then(f)
+    .catch(function(err){toast((err&&err.message)||'Network error');});
+}
+function t(u,f){
+  fetch(u)
+    .then(function(r){return r.json();})
+    .then(f)
+    .catch(function(err){toast((err&&err.message)||'Network error');});
+}
+
+function reg(){
+  j({team_name:val('name'),pin:val('pin')},'/api/register',function(r){
+    if(r && r.ok){ team_id=r.team_id; team_name=val('name'); onAuth(); }
+    else { toast(JSON.stringify(r)); }
+  });
+}
+function login(){
+  j({team_name:val('name'),pin:val('pin')},'/api/login',function(r){
+    if(r && r.ok){ team_id=r.team_id; team_name=val('name'); onAuth(); }
+    else { toast(JSON.stringify(r)); }
+  });
+}
 
 function onAuth(){
   id('me').textContent='Logged in as: '+team_name;
@@ -570,9 +640,14 @@ function onAuth(){
 }
 
 function loadLB(){
-  t('/api/leaderboard',r=>{
-    let h='<ol>';
-    (r.teams||[]).forEach(x=>{ h+=`<li>${x.name} — ${x.points} pts (${x.found})</li>` });
+  t('/api/leaderboard',function(r){
+    var h='<ol>';
+    var teams=(r&&r.teams)||[];
+    if(teams.length===0){ h+='<li>No teams yet</li>'; }
+    for(var i=0;i<teams.length;i++){
+      var x=teams[i];
+      h+='<li>'+escapeHtml(x.name)+' — '+(x.points||0)+' pts ('+(x.found||0)+')</li>';
+    }
     h+='</ol>';
     id('lb').innerHTML=h;
     id('ts').textContent=new Date().toLocaleTimeString();
@@ -581,47 +656,67 @@ function loadLB(){
 
 function loadTeamItems(){
   if(!team_id) return;
-  j({team_id}, '/api/team/items', r=>{
-    const tb=id('itemsBody');
+  j({team_id:team_id},'/api/team/items',function(r){
+    var tb=id('itemsBody');
     tb.innerHTML='';
-    (r.items||[]).forEach(it=>{
-      const found = !!it.found;
-      const st = found ? '<span class="status-found">Found</span>' : '<span class="status-miss">Missing</span>';
-      tb.insertAdjacentHTML('beforeend', `<tr><td>${it.name}</td><td>${it.points}</td><td>${st}</td></tr>`);
-    });
+    var items=(r&&r.items)||[];
+    for(var i=0;i<items.length;i++){
+      var it=items[i];
+      var found=!!it.found;
+      var st=found ? '<span class="status-found">Found</span>' : '<span class="status-miss">Missing</span>';
+      tb.insertAdjacentHTML('beforeend',
+        '<tr><td>'+escapeHtml(it.name)+'</td><td>'+(it.points||0)+'</td><td>'+st+'</td></tr>');
+    }
   });
 }
 
 function submitCode(){
-  const token = val('codeword').trim();
+  var token = val('codeword').trim();
   if(!team_id){ toast('Please register/login first.'); return; }
   if(!token){ toast('Enter a codeword'); return; }
   busy(true);
-  j({team_id, token}, '/api/team/submit_code', r=>{
+  j({team_id:team_id, token:token},'/api/team/submit_code',function(r){
     busy(false);
-    if(r.ok){ toast(`+${r.awarded} pts! Total: ${r.total}`); id('codeword').value=''; loadTeamItems(); loadLB(); }
-    else if(r.duplicate){ toast('Already found.'); loadTeamItems(); }
-    else { toast(JSON.stringify(r)); }
+    if(r && r.ok){
+      toast('+'+(r.awarded||0)+' pts! Total: '+(r.total||0));
+      id('codeword').value='';
+      loadTeamItems(); loadLB();
+    }else if(r && r.duplicate){
+      toast('Already found.');
+      loadTeamItems();
+    }else{
+      toast(JSON.stringify(r));
+    }
   });
 }
 
 // --- tiny UX helpers ---
-let _busy=0; 
+var _busy=0;
 function busy(on){
   _busy = on ? (_busy+1) : Math.max(0,_busy-1);
   document.body.style.cursor = _busy ? 'progress' : '';
 }
 function toast(msg){
-  console.log('[toast]', msg);
-  alert(msg);
+  try{ console.log('[toast]', msg); alert(msg); }catch(e){}
+}
+function escapeHtml(s){
+  if(s==null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
 }
 
 // init
-loadLB(); setInterval(loadLB,6000);
+loadLB();
+setInterval(loadLB,6000);
 </script>
+
 </body></html>)HTML";
 
-// Admin (unchanged except wording)
+// Admin (wording tuned)
 static const char HTML_ADMIN[] PROGMEM = R"ADMIN(<!doctype html><html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Scavenger Admin</title>
@@ -649,7 +744,7 @@ th,td{border:1px solid #ddd;padding:6px;text-align:left}
 </div>
 
 <hr>
-<h3>Game Wi‑Fi</h3>
+<h3>Game Wi-Fi</h3>
 <p class="small">This SSID will be used when switching to GAME mode (open network, no password).</p>
 <div class="row">
   <input id="game_ssid" placeholder="Game SSID">
@@ -745,7 +840,7 @@ static const char HTML_CAPTIVE[] PROGMEM = R"HTML(
 <!doctype html><html><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Scavenger Hunt Wi‑Fi</title>
+<title>Scavenger Hunt Wi-Fi</title>
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;
        text-align:center;padding:2rem;background:#fafafa;color:#111}
@@ -760,7 +855,7 @@ setTimeout(()=>{ try{ location.replace('/app'); }catch(e){} }, 600);
 </script>
 </head><body>
   <h1>You’re connected 🎉</h1>
-  <p>This is the Wi‑Fi sign‑in screen. The game portal should open automatically. If not, tap below.</p>
+  <p>This is the Wi-Fi sign-in screen. The game portal should open automatically. If not, tap below.</p>
   <a class="button" href="/app" rel="noopener">Open Game Portal</a>
   <p>If that doesn’t open, manually go to <code>http://192.168.4.1</code> in your browser.</p>
 </body></html>
@@ -832,12 +927,19 @@ void setupRoutes() {
 
   // Static pages
   server.on("/app", HTTP_GET, [](AsyncWebServerRequest *req){ req->send(200,"text/html", htmlIndex()); });
-  server.on("/admin", HTTP_GET, [](AsyncWebServerRequest *req){ req->send(200,"text/html", htmlAdmin()); });
+
+  // Protect /admin page after first-time setup
+  server.on("/admin", HTTP_GET, [](AsyncWebServerRequest *req){
+    if (!adminGuard(req)) return;
+    req->send(200,"text/html", htmlAdmin());
+  });
+
   server.on("/manifest.webmanifest", HTTP_GET, [](AsyncWebServerRequest *req){ req->send(200,"application/manifest+json", pwaManifest()); });
   server.on("/sw.js", HTTP_GET, [](AsyncWebServerRequest *req){ req->send(200,"application/javascript", pwaServiceWorker()); });
 
   // ---- Admin ----
   server.on("/api/admin/status", HTTP_GET, [](AsyncWebServerRequest *req){
+    if (!adminGuard(req)) return;
     DynamicJsonDocument d(256);
     d["mode"] = (g_config.mode==MODE_GAME?"game":"setup");
     d["fw_version"] = FW_VERSION;
@@ -846,6 +948,7 @@ void setupRoutes() {
     sendJSON(req,200,d);
   });
 
+  // First-time password setter (unguarded until set)
   server.on("/api/admin/setup", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
       if (g_config.admin_hash.length() > 0) {
@@ -865,6 +968,7 @@ void setupRoutes() {
   // Update game_ssid
   server.on("/api/admin/game_ssid", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
+      if (!adminGuard(req)) return;
       String body = getBody(req, data, len);
       DynamicJsonDocument d(256);
       if (deserializeJson(d, body)) {
@@ -880,6 +984,7 @@ void setupRoutes() {
   // Admin checkpoints: POST save; GET list (for form)
   server.on("/api/admin/checkpoints", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
+      if (!adminGuard(req)) return;
       String body = getBody(req, data, len);
       DynamicJsonDocument d(16384);
       if (deserializeJson(d, body)) { DynamicJsonDocument e(128); e["error"]="bad_json"; sendJSON(req,400,e); return; }
@@ -900,6 +1005,7 @@ void setupRoutes() {
     });
 
   server.on("/api/admin/checkpoints", HTTP_GET, [](AsyncWebServerRequest *req){
+    if (!adminGuard(req)) return;
     DynamicJsonDocument d(8192);
     JsonArray arr = d.createNestedArray("items");
     for (auto &c : g_checkpoints) {
@@ -912,6 +1018,7 @@ void setupRoutes() {
   // Switch mode
   server.on("/api/admin/mode", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
+      if (!adminGuard(req)) return;
       String body = getBody(req, data, len);
       DynamicJsonDocument d(256);
       if (deserializeJson(d, body)) { DynamicJsonDocument e(128); e["error"]="bad_json"; sendJSON(req,400,e); return; }
@@ -924,6 +1031,7 @@ void setupRoutes() {
   // Factory reset
   server.on("/api/admin/factory_reset", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
+      if (!adminGuard(req)) return;
       String body = getBody(req, data, len);
       DynamicJsonDocument d(256);
       if (deserializeJson(d, body)) { DynamicJsonDocument e(128); e["error"]="bad_json"; sendJSON(req,400,e); return; }
@@ -999,7 +1107,7 @@ void setupRoutes() {
       sendJSON(req,200,out);
     });
 
-  // Codeword submit (new canonical endpoint)
+  // Codeword submit (canonical)
   server.on("/api/team/submit_code", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
       String body = getBody(req, data, len);
@@ -1012,12 +1120,10 @@ void setupRoutes() {
       token.trim();
       if (token.length()==0) { DynamicJsonDocument e(128); e["error"]="empty_token"; sendJSON(req,400,e); return; }
 
-      // Case-insensitive match for convenience (normalize to exact token_text if desired)
-      // Here we just compare as-is; to make insensitive, compare lowercase() versions.
+      // Case-insensitive match convenience
       Checkpoint* c = nullptr;
       for (auto &cc : g_checkpoints) {
         if (consttime_eq(cc.token_text, token)) { c = &cc; break; }
-        // Optional: case-insensitive
         String a = cc.token_text; a.toLowerCase();
         String b = token; b.toLowerCase();
         if (a == b) { c = &cc; break; }
@@ -1035,24 +1141,15 @@ void setupRoutes() {
       sendJSON(req,200,ok);
     });
 
-  // Back-compat alias: allow old client calls to /scan_qr to behave the same
+  // Back-compat alias: allow old clients calling /scan_qr to behave the same
   server.on("/api/team/scan_qr", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t a, size_t b){
-      // just forward to /submit_code logic by calling the same code
-      // (copy body and reuse)
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t){
+      // Forward semantics to submit_code
       String body = getBody(req, data, len);
       DynamicJsonDocument d(1024);
       if (deserializeJson(d, body)) { DynamicJsonDocument e(128); e["error"]="bad_json"; sendJSON(req,400,e); return; }
-      // Rename expected keys if needed; here they match already (team_id, token)
       String team_id = JV_toString(d["team_id"], "");
       String token   = JV_toString(d["token"], "");
-      // Rebuild and call the canonical handler path
-      DynamicJsonDocument forwarded(1024);
-      forwarded["team_id"] = team_id;
-      forwarded["token"]   = token;
-      String out; serializeJson(forwarded, out);
-      // Manually invoke by reusing the same code path (duplicate of logic to keep it simple here)
-      // For brevity, just re-run the same chunk:
       Team* t = findTeamById(team_id);
       if (!t) { DynamicJsonDocument e(128); e["error"]="team_not_found"; sendJSON(req,404,e); return; }
       token.trim();
@@ -1136,6 +1233,12 @@ void setup() {
   mountFS();
   loadAll();
 
+  // If no admin password yet, force SETUP mode and persist it
+  if (g_config.admin_hash.length() == 0) {
+    g_config.mode = MODE_SETUP;
+    saveConfig();
+  }
+
   if (g_config.mode == MODE_SETUP) enterSetupMode();
   else enterGameMode();
 
@@ -1150,6 +1253,5 @@ void setup() {
 
 void loop() {
   dnsServer.processNextRequest();
-  vTaskDelay(pdMS_TO_TICKS(10));  // <-- portable and clear
+  vTaskDelay(pdMS_TO_TICKS(10));  // portable and clear
 }
-
