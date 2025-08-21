@@ -119,6 +119,10 @@ void factoryReset(bool wipeAll);
 bool saneToken(const String& s);
 String sanitizeName(const String& s);
 
+// NEW (Teams admin helpers)
+bool wipeAllTeams();
+bool deleteTeamById(const String& id);
+
 // Config
 struct Config {
   String admin_hash;  // sha256
@@ -716,7 +720,7 @@ setInterval(loadLB,6000);
 
 </body></html>)HTML";
 
-// Admin (wording tuned)
+// Admin (wording tuned) + NEW Teams management section
 static const char HTML_ADMIN[] PROGMEM = R"ADMIN(<!doctype html><html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Scavenger Admin</title>
@@ -725,11 +729,13 @@ body{font-family:system-ui;margin:16px}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 input,button{font-size:1rem;padding:8px;border-radius:8px;border:1px solid #bbb}
 button{background:#222;color:#fff;border:0;cursor:pointer;transition:transform .04s ease,filter .04s ease}
+button.ghost{background:#f3f3f3;color:#111;border:1px solid #ccc}
 button:active{transform:translateY(1px);filter:brightness(0.92)}
 table{width:100%;border-collapse:collapse;margin-top:8px}
 th,td{border:1px solid #ddd;padding:6px;text-align:left}
 .small{color:#555}
 .badge{background:#eee;border-radius:999px;padding:2px 8px;margin-left:6px}
+.danger{background:#b00020;color:#fff;border-color:#8a0019}
 </style>
 
 </head><body>
@@ -764,6 +770,18 @@ th,td{border:1px solid #ddd;padding:6px;text-align:left}
 <table id="tbl">
   <thead><tr><th>Name</th><th>Token (codeword)</th><th>Points</th><th></th></tr></thead>
   <tbody id="rows"></tbody>
+</table>
+
+<hr>
+<h3>Teams</h3>
+<p class="small">Manage registered teams. You can remove a single team or wipe all teams between groups.</p>
+<div class="row">
+  <button class="danger" onclick="wipeTeams()">Wipe All Teams</button>
+  <span id="teamsStatus" class="small"></span>
+</div>
+<table id="teamsTbl">
+  <thead><tr><th>ID</th><th>Name</th><th>Points</th><th>Found</th><th>Created</th><th></th></tr></thead>
+  <tbody id="teamsRows"><tr><td colspan="6"><i>Loading…</i></td></tr></tbody>
 </table>
 
 <hr>
@@ -808,6 +826,7 @@ function reload(){
   fetch('/api/admin/status').then(r=>r.json()).then(x=>{
     if (x.game_ssid) document.getElementById('game_ssid').value=x.game_ssid;
   });
+  loadTeams();
 }
 
 function save(){
@@ -829,6 +848,53 @@ function mode(m){
 function factory(all){
   fetch('/api/admin/factory_reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wipe_all:all})})
     .then(r=>r.json()).then(x=>alert(JSON.stringify(x)));
+}
+
+// ---- Teams UI ----
+function loadTeams(){
+  fetch('/api/admin/teams').then(r=>r.json()).then(x=>{
+    const rows = document.getElementById('teamsRows');
+    rows.innerHTML = '';
+    const t = (x && x.teams) || [];
+    if (t.length === 0){
+      rows.innerHTML = '<tr><td colspan="6"><i>No teams yet</i></td></tr>';
+      return;
+    }
+    t.forEach(item=>{
+      rows.insertAdjacentHTML('beforeend',
+        `<tr>
+          <td>${item.id||''}</td>
+          <td>${escapeHtml(item.name||'')}</td>
+          <td>${item.points||0}</td>
+          <td>${item.found||0}</td>
+          <td>${item.created_at||0}</td>
+          <td><button class="ghost" onclick="delTeam('${item.id||''}')">Delete</button></td>
+        </tr>`);
+    });
+  }).catch(()=>{ document.getElementById('teamsRows').innerHTML='<tr><td colspan="6">Failed to load</td></tr>';});
+}
+
+function delTeam(id){
+  if(!id) return;
+  if(!confirm('Delete team '+id+'?')) return;
+  fetch('/api/admin/teams/'+encodeURIComponent(id), { method:'DELETE' })
+    .then(r=>r.json()).then(()=>loadTeams())
+    .catch(()=>alert('Delete failed'));
+}
+
+function wipeTeams(){
+  if(!confirm('Wipe ALL teams? This cannot be undone.')) return;
+  document.getElementById('teamsStatus').textContent = 'Wiping…';
+  fetch('/api/admin/teams/wipe', { method:'POST' })
+    .then(r=>r.json()).then(()=>{ document.getElementById('teamsStatus').textContent='Done.'; loadTeams(); })
+    .catch(()=>{ document.getElementById('teamsStatus').textContent='Failed.'; });
+}
+
+function escapeHtml(s){
+  if(s==null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 reload();
@@ -1014,6 +1080,48 @@ void setupRoutes() {
     }
     sendJSON(req,200,d);
   });
+
+  // ---------- NEW: Teams Admin API ----------
+
+  // List teams
+  server.on("/api/admin/teams", HTTP_GET, [](AsyncWebServerRequest *req){
+    if (!adminGuard(req)) return;
+    // Ensure points are up to date
+    for (auto &t : g_teams) updatePointsFromFound(t);
+    DynamicJsonDocument d(16384);
+    JsonArray arr = d.createNestedArray("teams");
+    for (auto &t : g_teams) {
+      JsonObject o = arr.createNestedObject();
+      o["id"] = t.id;
+      o["name"] = t.name;
+      o["points"] = t.points;
+      o["found"] = (int)t.found.size();
+      o["created_at"] = t.created_at;
+    }
+    sendJSON(req,200,d);
+  });
+
+  // Wipe all teams
+  server.on("/api/admin/teams/wipe", HTTP_POST, [](AsyncWebServerRequest *req){
+    if (!adminGuard(req)) return;
+    bool ok = wipeAllTeams();
+    DynamicJsonDocument d(64); d["ok"] = ok;
+    sendJSON(req, ok ? 200 : 500, d);
+  });
+
+  // Delete one team
+  server.on("^\\/api\\/admin\\/teams\\/([A-Za-z0-9_\\-\\.]+)$", HTTP_DELETE,
+    [](AsyncWebServerRequest* req){
+      if (!adminGuard(req)) return;
+      String id = req->pathArg(0);
+      if (id.isEmpty()) {
+        DynamicJsonDocument e(64); e["error"]="missing_id"; sendJSON(req,400,e); return;
+      }
+      bool ok = deleteTeamById(id);
+      DynamicJsonDocument d(64); d["ok"]=ok;
+      sendJSON(req, ok?200:404, d);
+    }
+  );
 
   // Switch mode
   server.on("/api/admin/mode", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
@@ -1214,6 +1322,37 @@ void factoryReset(bool wipeAll) {
     g_config.mode = MODE_SETUP;
     saveConfig();
   }
+}
+
+// ------------------ NEW: Teams admin helpers (impl) ------------------
+
+bool wipeAllTeams() {
+  // clear memory
+  g_teams.clear();
+  // write empty array to file (keeps file present)
+  DynamicJsonDocument doc(8);
+  JsonArray arr = doc.to<JsonArray>();
+  String out; serializeJson(arr, out);
+  if (!writeStringToFile(FILE_TEAMS, out)) {
+    // as fallback, remove outright
+    removeIfExists(FILE_TEAMS);
+    // recreate empty array file
+    writeStringToFile(FILE_TEAMS, "[]");
+  }
+  return true;
+}
+
+bool deleteTeamById(const String& id) {
+  bool changed = false;
+  std::vector<Team> keep;
+  keep.reserve(g_teams.size());
+  for (auto &t : g_teams) {
+    if (t.id == id) { changed = true; continue; }
+    keep.push_back(t);
+  }
+  if (!changed) return false;
+  g_teams.swap(keep);
+  return saveTeams();
 }
 
 // ------------------ Setup / Loop ------------------
